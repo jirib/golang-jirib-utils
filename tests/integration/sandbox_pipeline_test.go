@@ -65,7 +65,7 @@ func TestSandbox_PipelineIntegration(t *testing.T) {
 	if !strings.Contains(logOutput, "exec_id=") {
 		t.Errorf("log output missing exec_id correlation attribute:\n%s", logOutput)
 	}
-	if !strings.Contains(logOutput, `msg="exec"`) {
+	if !strings.Contains(logOutput, "msg=exec ") && !strings.Contains(logOutput, `msg="exec"`) {
 		t.Errorf("log output missing exec start message:\n%s", logOutput)
 	}
 	if !strings.Contains(logOutput, `msg="exec done"`) {

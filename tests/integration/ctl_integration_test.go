@@ -45,11 +45,14 @@ func TestCTL_ClientServerEchoAndErrors(t *testing.T) {
 		t.Fatalf("srv.Listen failed: %v", err)
 	}
 
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := srv.Serve(); err != nil && !errors.Is(err, ctl.ErrClosed) {
+		if err := srv.Serve(srvCtx); err != nil && !errors.Is(err, ctl.ErrClosed) {
 			t.Errorf("srv.Serve failed: %v", err)
 		}
 	}()
@@ -119,7 +122,9 @@ func TestCTL_ClientDeadlineExceeded(t *testing.T) {
 	}
 	defer srv.Close()
 
-	go func() { _ = srv.Serve() }()
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	go func() { _ = srv.Serve(srvCtx) }()
 
 	client := &ctl.Client{
 		Path:    sockPath,
@@ -147,6 +152,7 @@ func TestCTL_StaleSocketCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	_ = ln.Close()
 
 	if _, err := os.Lstat(sockPath); err != nil {
