@@ -243,7 +243,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 }
 
 // Close stops accepting connections and unlinks the socket file.
-// os.SameFile is checked to avoid unlinking a socket bound by a successor process.
+// os.SameFile and ModTime are checked to avoid unlinking a socket bound by a successor process
+// (even if the inode was recycled by the filesystem).
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
@@ -255,7 +256,7 @@ func (s *Server) Close() error {
 		}
 		if s.Path != "" {
 			if fi, statErr := os.Lstat(s.Path); statErr == nil && fi.Mode()&os.ModeSocket != 0 {
-				if s.bound != nil && !os.SameFile(fi, s.bound) {
+				if s.bound != nil && (!os.SameFile(fi, s.bound) || !fi.ModTime().Equal(s.bound.ModTime())) {
 					s.Log().Info("leaving control socket in place: it is no longer the one this server bound", "path", s.Path)
 					return
 				}

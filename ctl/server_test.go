@@ -444,6 +444,10 @@ func TestCloseLeavesASuccessorsSocketAlone(t *testing.T) {
 	old.ln = nil
 	os.Remove(path)
 
+	// Ensure the replacement socket gets a strictly later timestamp even on
+	// filesystems with coarse timestamp resolution.
+	time.Sleep(10 * time.Millisecond)
+
 	successor, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)
