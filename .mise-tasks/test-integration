@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Runs dedicated cross-package integration tests."
+set -euo pipefail
+
+go test -race -count=1 -v ./tests/integration/...

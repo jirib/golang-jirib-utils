@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Cleans Go test cache and temporary test artifacts."
+set -euo pipefail
+
+go clean -testcache
+rm -f coverage.out coverage.html
+if [ -d ".tmp" ]; then
+    chmod -R u+w .tmp 2>/dev/null || true
+    rm -rf .tmp
+fi

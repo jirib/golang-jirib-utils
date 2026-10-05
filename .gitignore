@@ -1,0 +1,10 @@
+# The user's global gitignore excludes a top-level "target/" directory
+# (Rust/Java build-output convention). This repo has a legitimate Go
+# package at rpmpkg/target/ with the same name, so un-ignore it explicitly.
+!/rpmpkg/target/
+!/rpmpkg/target/**
+
+# Test and coverage artifacts
+*.out
+*.cov
+.tmp/
