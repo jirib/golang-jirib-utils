@@ -53,16 +53,17 @@ func WritableMount(src, dst string) Mount { return Mount{Src: src, Dst: dst} }
 
 // SandboxSpec specifies execution parameters for a sandboxed process.
 type SandboxSpec struct {
-	Command    []string
-	RootFS     string
-	Root       RootMode
-	Mounts     []Mount
-	PrivateTmp bool
-	Network    NetworkMode
-	Env        []string
-	ClearEnv   bool
-	Cwd        string
-	Timeout    time.Duration
+	Command     []string
+	RootFS      string
+	Root        RootMode
+	Mounts      []Mount
+	PrivateTmp  bool
+	Network     NetworkMode
+	Env         []string
+	ClearEnv    bool
+	Cwd         string
+	Timeout     time.Duration
+	QuietOutput bool
 }
 
 // SandboxResult contains captured execution output.
@@ -93,7 +94,7 @@ func (b BwrapBackend) Run(ctx context.Context, spec SandboxSpec) (SandboxResult,
 		return SandboxResult{}, fmt.Errorf("bwrap (bubblewrap) not found on PATH: %w", err)
 	}
 	args := bwrapArgs(spec)
-	return execute(ctx, b.Name(), spec.Command, spec.Timeout, func(runCtx context.Context) *exec.Cmd {
+	return execute(ctx, b.Name(), spec.Command, spec.Timeout, spec.QuietOutput, func(runCtx context.Context) *exec.Cmd {
 		return exec.CommandContext(runCtx, "bwrap", args...)
 	})
 }
@@ -186,11 +187,13 @@ func (bb *boundedBuffer) String() string { return bb.buf.String() }
 type debugLineWriter struct {
 	logger  *slog.Logger
 	cmd     string
+	stream  string
+	quiet   bool
 	pending []byte
 }
 
 func (w *debugLineWriter) Write(p []byte) (int, error) {
-	if !w.logger.Enabled(context.Background(), slog.LevelDebug) {
+	if w.quiet || !w.logger.Enabled(context.Background(), slog.LevelDebug) {
 		return len(p), nil
 	}
 	w.pending = append(w.pending, p...)
@@ -200,7 +203,13 @@ func (w *debugLineWriter) Write(p []byte) (int, error) {
 			break
 		}
 		if line := strings.TrimSpace(string(w.pending[:i])); line != "" {
-			w.logger.Debug("cmd output", "cmd", w.cmd, "line", line)
+			w.logger.Debug("cmd output",
+				"component", "executor",
+				"event", "exec.output",
+				"stream", w.stream,
+				"cmd", w.cmd,
+				"line", line,
+			)
 		}
 		w.pending = w.pending[i+1:]
 	}
@@ -208,12 +217,26 @@ func (w *debugLineWriter) Write(p []byte) (int, error) {
 }
 
 func (w *debugLineWriter) flush() {
-	if len(w.pending) > 0 && w.logger.Enabled(context.Background(), slog.LevelDebug) {
+	if len(w.pending) > 0 && !w.quiet && w.logger.Enabled(context.Background(), slog.LevelDebug) {
 		if line := strings.TrimSpace(string(w.pending)); line != "" {
-			w.logger.Debug("cmd output", "cmd", w.cmd, "line", line)
+			w.logger.Debug("cmd output",
+				"component", "executor",
+				"event", "exec.output",
+				"stream", w.stream,
+				"cmd", w.cmd,
+				"line", line,
+			)
 		}
 		w.pending = nil
 	}
+}
+
+func tail(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[len(s)-maxLen:]
 }
 
 // execute runs a command with timeout, output capture (capped at 10MB), and outcome logging.
@@ -222,6 +245,7 @@ func execute(
 	name string,
 	command []string,
 	timeout time.Duration,
+	quietOutput bool,
 	newCmd func(context.Context) *exec.Cmd,
 ) (SandboxResult, error) {
 	if len(command) == 0 {
@@ -239,15 +263,22 @@ func execute(
 	errBuf := &boundedBuffer{cap: outputCap}
 
 	execID := logctx.NewID()
-	log := logctx.FromWithID(runCtx, execID)
+	runCtx = logctx.WithExecID(runCtx, execID)
+	log := logctx.From(runCtx)
 
 	cmd := newCmd(runCtx)
-	outWriter := &debugLineWriter{logger: log, cmd: command[0]}
-	errWriter := &debugLineWriter{logger: log, cmd: command[0]}
+	outWriter := &debugLineWriter{logger: log, cmd: command[0], stream: "stdout", quiet: quietOutput}
+	errWriter := &debugLineWriter{logger: log, cmd: command[0], stream: "stderr", quiet: quietOutput}
 	cmd.Stdout = io.MultiWriter(outBuf, outWriter)
 	cmd.Stderr = io.MultiWriter(errBuf, errWriter)
 
-	log.Debug("exec", "sandbox", name, "cmd", command[0], "args", strings.Join(command[1:], " "))
+	log.Info("exec",
+		"component", "executor",
+		"event", "exec.started",
+		"sandbox", name,
+		"cmd", command[0],
+		"args", strings.Join(command[1:], " "),
+	)
 	start := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
@@ -262,7 +293,15 @@ func execute(
 	}
 
 	outcome := execout.Classify(runCtx.Err(), runErr, cmd.ProcessState)
-	log.Debug("exec done", outcome.Attrs(elapsed, timeout, "cmd", command[0])...)
+	attrs := outcome.Attrs(elapsed, timeout,
+		"component", "executor",
+		"event", "exec.completed",
+		"cmd", command[0],
+	)
+	if runErr != nil && len(res.Stderr) > 0 {
+		attrs = append(attrs, "stderr", tail(res.Stderr, 4096))
+	}
+	log.Info("exec done", attrs...)
 
 	if runErr != nil {
 		return res, outcome.Wrap("sandboxed command", timeout, runErr)

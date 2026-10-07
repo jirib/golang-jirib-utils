@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jirib/golang-jirib-utils/logctx"
 	"github.com/jirib/golang-jirib-utils/mcpserver/auth"
 )
 
@@ -57,26 +58,69 @@ func (s *Server) log() *slog.Logger {
 
 func (s *Server) invoke(w http.ResponseWriter, r *http.Request, h Handler) {
 	start := time.Now()
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		reqID = logctx.NewID()
+	}
+	w.Header().Set("X-Request-ID", reqID)
+
+	ctx := logctx.With(r.Context(), s.log())
+	ctx = logctx.WithRequestID(ctx, reqID)
+	log := logctx.From(ctx).With("component", "httpapi")
+
+	log.Info("request started",
+		"event", "request.started",
+		"method", r.Method,
+		"path", r.URL.Path,
+	)
+
 	payload, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
-		s.log().Warn("http request body read failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		log.Warn("request body read failed",
+			"event", "request.failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", http.StatusBadRequest,
+			"error", err,
+			"duration", time.Since(start),
+		)
 		s.writeError(w, err)
 		return
 	}
 	if len(payload) > maxBody {
-		s.log().Warn("http request body exceeds size limit", "method", r.Method, "path", r.URL.Path, "limit", maxBody)
+		log.Warn("request body exceeds size limit",
+			"event", "request.failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", http.StatusRequestEntityTooLarge,
+			"limit", maxBody,
+			"duration", time.Since(start),
+		)
 		s.writeJSONStatus(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds limit"})
 		return
 	}
 
-	result, err := h(r.Context(), payload)
+	result, err := h(ctx, payload)
 	if err != nil {
-		s.log().Warn("http request failed", "method", r.Method, "path", r.URL.Path, "error", err, "duration", time.Since(start))
+		log.Warn("request failed",
+			"event", "request.failed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", http.StatusBadRequest,
+			"error", err,
+			"duration", time.Since(start),
+		)
 		s.writeError(w, err)
 		return
 	}
 	s.writeJSON(w, result)
-	s.log().Debug("http request served", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+	log.Info("request completed",
+		"event", "request.completed",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", http.StatusOK,
+		"duration", time.Since(start),
+	)
 }
 
 // Handler returns the underlying http.Handler, applying BearerMiddleware if Token is configured.

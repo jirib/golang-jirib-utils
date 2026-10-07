@@ -625,3 +625,151 @@ func TestSandbox_TimeoutIsReportedAsTimeout(t *testing.T) {
 		t.Errorf("a timeout must record which ceiling fired: %s", done)
 	}
 }
+
+func TestSandbox_StructuredLifecycleEventsAndStreams(t *testing.T) {
+	requireBwrap(t)
+
+	var buf bytes.Buffer
+	caller := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := logctx.With(context.Background(), caller)
+
+	backend := NewBwrap()
+	topdir := t.TempDir()
+	spec := SandboxSpec{
+		Command:    []string{"sh", "-c", "echo out-line && echo err-line >&2"},
+		RootFS:     "/",
+		Root:       RootReadOnly,
+		Mounts:     []Mount{WritableMount(topdir, topdir)},
+		PrivateTmp: true,
+		Network:    NetworkNone,
+		Cwd:        topdir,
+		Timeout:    30 * time.Second,
+	}
+
+	if _, err := backend.Run(ctx, spec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var sawStart, sawDone, sawStdout, sawStderr bool
+
+	for _, line := range lines {
+		fields := parseLogFields(line)
+		if fields["component"] != "executor" {
+			t.Errorf("expected component=executor on line: %s", line)
+		}
+		switch fields["event"] {
+		case "exec.started":
+			sawStart = true
+			if fields["cmd"] != "sh" {
+				t.Errorf("expected cmd=sh, got %q", fields["cmd"])
+			}
+		case "exec.completed":
+			sawDone = true
+			if fields["outcome"] != "ok" || fields["exit_code"] != "0" {
+				t.Errorf("unexpected completed fields: %v", fields)
+			}
+		case "exec.output":
+			if fields["stream"] == "stdout" && strings.Contains(fields["line"], "out-line") {
+				sawStdout = true
+			}
+			if fields["stream"] == "stderr" && strings.Contains(fields["line"], "err-line") {
+				sawStderr = true
+			}
+		}
+	}
+
+	if !sawStart {
+		t.Error("missing exec.started event")
+	}
+	if !sawDone {
+		t.Error("missing exec.completed event")
+	}
+	if !sawStdout {
+		t.Error("missing stdout exec.output event")
+	}
+	if !sawStderr {
+		t.Error("missing stderr exec.output event")
+	}
+}
+
+func TestSandbox_QuietOutputSuppressesOutputLines(t *testing.T) {
+	requireBwrap(t)
+
+	var buf bytes.Buffer
+	caller := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := logctx.With(context.Background(), caller)
+
+	backend := NewBwrap()
+	topdir := t.TempDir()
+	spec := SandboxSpec{
+		Command:     []string{"sh", "-c", "echo noisy-out && echo noisy-err >&2"},
+		RootFS:      "/",
+		Root:        RootReadOnly,
+		Mounts:      []Mount{WritableMount(topdir, topdir)},
+		PrivateTmp:  true,
+		Network:     NetworkNone,
+		Cwd:         topdir,
+		Timeout:     30 * time.Second,
+		QuietOutput: true,
+	}
+
+	if _, err := backend.Run(ctx, spec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	for _, line := range lines {
+		fields := parseLogFields(line)
+		if fields["event"] == "exec.output" || fields["msg"] == "cmd output" {
+			t.Errorf("QuietOutput failed to suppress output line: %s", line)
+		}
+	}
+}
+
+func TestSandbox_FailedCommandAttachesStderr(t *testing.T) {
+	requireBwrap(t)
+
+	var buf bytes.Buffer
+	caller := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := logctx.With(context.Background(), caller)
+
+	backend := NewBwrap()
+	topdir := t.TempDir()
+	spec := SandboxSpec{
+		Command:    []string{"sh", "-c", "echo 'detailed reason for failure' >&2 && exit 7"},
+		RootFS:     "/",
+		Root:       RootReadOnly,
+		Mounts:     []Mount{WritableMount(topdir, topdir)},
+		PrivateTmp: true,
+		Network:    NetworkNone,
+		Cwd:        topdir,
+		Timeout:    30 * time.Second,
+	}
+
+	_, err := backend.Run(ctx, spec)
+	if err == nil {
+		t.Fatal("expected error from non-zero exit")
+	}
+
+	var doneLine string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if strings.Contains(line, `event=exec.completed`) || strings.Contains(line, `msg="exec done"`) {
+			doneLine = line
+		}
+	}
+	if doneLine == "" {
+		t.Fatalf("missing exec done line in:\n%s", buf.String())
+	}
+
+	fields := parseLogFields(doneLine)
+	if fields["outcome"] != "exit" {
+		t.Errorf("outcome = %q, want exit", fields["outcome"])
+	}
+	if fields["exit_code"] != "7" {
+		t.Errorf("exit_code = %q, want 7", fields["exit_code"])
+	}
+	if !strings.Contains(fields["stderr"], "detailed reason for failure") {
+		t.Errorf("stderr attribute missing failure reason in line: %s", doneLine)
+	}
+}

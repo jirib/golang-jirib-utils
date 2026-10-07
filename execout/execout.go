@@ -68,13 +68,14 @@ func Classify(ctxErr, runErr error, ps *os.ProcessState) Result {
 
 // Attrs formats execution result attributes, appending them to base.
 func (r Result) Attrs(duration, deadline time.Duration, base ...any) []any {
-	attrs := make([]any, 0, len(base)+10)
+	attrs := make([]any, 0, len(base)+12)
 	attrs = append(attrs, base...)
 	attrs = append(attrs, "outcome", string(r.Outcome))
 	if r.PID != 0 {
 		attrs = append(attrs, "pid", r.PID)
 	}
 	attrs = append(attrs, "rc", r.RC)
+	attrs = append(attrs, "exit_code", r.RC)
 	if r.Signal != "" {
 		attrs = append(attrs, "signal", r.Signal)
 	}

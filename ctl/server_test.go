@@ -1,10 +1,12 @@
 package ctl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jirib/golang-jirib-utils/logctx"
 )
 
 // startServer binds a Server on a socket inside a temp dir and serves it in
@@ -584,6 +588,112 @@ func TestClientContextCancellationUnblocks(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Client.Call did not unblock upon context cancellation")
+	}
+}
+
+func TestServer_RequestCorrelationAndLifecycleEvents(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	var handlerReqID string
+	s := &Server{
+		Path:   filepath.Join(t.TempDir(), "ctl", SocketName),
+		Logger: logger,
+		TypeName: func(typ Type) string {
+			if typ == testCmd {
+				return "ping"
+			}
+			return typ.String()
+		},
+		Handler: func(ctx context.Context, typ Type, payload []byte) ([]byte, error) {
+			handlerReqID = logctx.RequestID(ctx)
+			return []byte(`{"ok":true}`), nil
+		},
+	}
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = s.Serve(ctx)
+	}()
+	c := &Client{Path: s.SocketPath()}
+	reply, err := c.CallRaw(context.Background(), testCmd, "ping")
+	if err != nil {
+		t.Fatalf("CallRaw: %v", err)
+	}
+	if string(reply) != `{"ok":true}` {
+		t.Errorf("reply = %s, want {\"ok\":true}", reply)
+	}
+
+	cancel()
+	_ = s.Close()
+	wg.Wait()
+
+	if handlerReqID == "" {
+		t.Fatal("handler received empty request_id")
+	}
+
+	rawLogs := buf.String()
+	lines := strings.Split(strings.TrimSpace(rawLogs), "\n")
+	if len(lines) == 0 {
+		t.Fatal("no logs captured")
+	}
+
+	var foundStarted, foundCompleted bool
+	for _, line := range lines {
+		// Verify no duplicate keys exist on any log line
+		fields := make(map[string]string)
+		for _, tok := range strings.Fields(line) {
+			if k, v, ok := strings.Cut(tok, "="); ok {
+				if _, exists := fields[k]; exists {
+					t.Fatalf("duplicate key %q in log line: %s", k, line)
+				}
+				fields[k] = strings.Trim(v, `"`)
+			}
+		}
+
+		// Verify anonymous peer=@ is never logged
+		if fields["peer"] == "@" {
+			t.Errorf("confusing peer=@ attribute present in line: %s", line)
+		}
+
+		if fields["event"] == "request.started" {
+			foundStarted = true
+			if fields["type"] != "ping" {
+				t.Errorf("expected type=ping, got %q", fields["type"])
+			}
+			if fields["component"] != "ctl" {
+				t.Errorf("expected component=ctl, got %q", fields["component"])
+			}
+			if fields["request_id"] != handlerReqID {
+				t.Errorf("expected request_id=%s, got %q", handlerReqID, fields["request_id"])
+			}
+		}
+		if fields["event"] == "request.completed" {
+			foundCompleted = true
+			if fields["type"] != "ping" {
+				t.Errorf("expected type=ping, got %q", fields["type"])
+			}
+			if fields["component"] != "ctl" {
+				t.Errorf("expected component=ctl, got %q", fields["component"])
+			}
+			if fields["request_id"] != handlerReqID {
+				t.Errorf("expected request_id=%s, got %q", handlerReqID, fields["request_id"])
+			}
+		}
+	}
+
+	if !foundStarted {
+		t.Errorf("event=request.started not found in logs:\n%s", rawLogs)
+	}
+	if !foundCompleted {
+		t.Errorf("event=request.completed not found in logs:\n%s", rawLogs)
 	}
 }
 

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -8,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jirib/golang-jirib-utils/logctx"
 )
 
 func newTestServer() *Server {
@@ -162,5 +165,81 @@ func TestPayloadExceedingMaxBodyReturns413(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "request body exceeds limit") {
 		t.Fatalf("body = %q, want request body exceeds limit", rec.Body.String())
+	}
+}
+
+func TestRequestCorrelationAndLifecycleEvents(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := New("", logger)
+
+	var receivedReqID string
+	s.Handle(http.MethodPost, "/work", func(ctx context.Context, payload []byte) (any, error) {
+		receivedReqID = logctx.RequestID(ctx)
+		return map[string]string{"result": "done"}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/work", strings.NewReader(`{"task":"compute"}`))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	headerReqID := rec.Header().Get("X-Request-ID")
+	if headerReqID == "" {
+		t.Fatal("response header missing X-Request-ID")
+	}
+	if receivedReqID != headerReqID {
+		t.Errorf("handler received request ID %q != header ID %q", receivedReqID, headerReqID)
+	}
+
+	logOut := buf.String()
+	for _, want := range []string{
+		"component=httpapi",
+		"event=request.started",
+		"event=request.completed",
+		"request_id=" + headerReqID,
+		"method=POST",
+		"path=/work",
+		"status=200",
+	} {
+		if !strings.Contains(logOut, want) {
+			t.Errorf("log output missing %q:\n%s", want, logOut)
+		}
+	}
+}
+
+func TestRequestCorrelation_PreservesExistingHeader(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := New("", logger)
+
+	const clientReqID = "client-req-998877"
+	var receivedReqID string
+	s.Handle(http.MethodGet, "/status", func(ctx context.Context, payload []byte) (any, error) {
+		receivedReqID = logctx.RequestID(ctx)
+		return map[string]string{"status": "healthy"}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set("X-Request-ID", clientReqID)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("X-Request-ID") != clientReqID {
+		t.Errorf("X-Request-ID = %q, want %q", rec.Header().Get("X-Request-ID"), clientReqID)
+	}
+	if receivedReqID != clientReqID {
+		t.Errorf("handler received req ID %q, want %q", receivedReqID, clientReqID)
+	}
+
+	logOut := buf.String()
+	if !strings.Contains(logOut, "request_id="+clientReqID) {
+		t.Errorf("log output missing client request_id %q:\n%s", clientReqID, logOut)
 	}
 }

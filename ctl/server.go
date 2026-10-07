@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/jirib/golang-jirib-utils/logctx"
 )
 
 // SocketMode is the file mode for the control socket (owner read/write only).
@@ -34,6 +36,8 @@ type Server struct {
 	App string
 	// Handler answers incoming requests.
 	Handler Handler
+	// TypeName optionally formats message types into human-readable command names for logging.
+	TypeName func(Type) string
 	// Logger receives log events. If nil, slog.Default() is used.
 	Logger *slog.Logger
 	// ReadTimeout bounds frame delivery time from clients.
@@ -196,21 +200,56 @@ func errorPayload(err error) []byte {
 	return b
 }
 
+func (s *Server) formatType(t Type) string {
+	if s.TypeName != nil {
+		if name := s.TypeName(t); name != "" {
+			return name
+		}
+	}
+	return t.String()
+}
+
+func (s *Server) peerAttrs(conn net.Conn) []any {
+	if conn == nil {
+		return nil
+	}
+	ra := conn.RemoteAddr()
+	if ra == nil {
+		return nil
+	}
+	str := ra.String()
+	if str == "" || str == "@" {
+		return nil
+	}
+	return []any{"peer", str}
+}
+
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	start := time.Now()
 	if s.ReadTimeout > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 	}
-	log := s.Log().With("peer", conn.RemoteAddr())
+
+	reqID := logctx.NewID()
+	ctx = logctx.With(ctx, s.Log())
+	ctx = logctx.WithRequestID(ctx, reqID)
+
+	baseLog := logctx.From(ctx).With("component", "ctl")
+	if peer := s.peerAttrs(conn); len(peer) > 0 {
+		baseLog = baseLog.With(peer...)
+	}
 
 	typ, payload, err := ReadMessage(conn)
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			log.Debug("control connection closed before sending a request")
+			baseLog.Debug("control connection closed before sending a request")
 			return
 		}
-		log.Warn("control socket protocol violation", "error", err)
+		baseLog.Warn("control socket protocol violation",
+			"event", "request.failed",
+			"error", err,
+		)
 		if s.ReadTimeout > 0 {
 			_ = conn.SetWriteDeadline(time.Now().Add(s.ReadTimeout))
 		}
@@ -218,14 +257,27 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if typ.IsResponse() {
-		log.Warn("control socket received a response frame instead of a request", "type", typ.String())
+		baseLog.Warn("control socket received a response frame instead of a request",
+			"event", "request.failed",
+			"type", s.formatType(typ),
+		)
 		return
 	}
-	log = log.With("type", typ.String())
+
+	typeStr := s.formatType(typ)
+	log := baseLog.With("type", typeStr)
+
+	log.Info("request started",
+		"event", "request.started",
+	)
 
 	result, err := s.invoke(ctx, typ, payload)
 	if err != nil {
-		log.Warn("control request failed", "error", err, "duration", time.Since(start))
+		log.Warn("request failed",
+			"event", "request.failed",
+			"error", err,
+			"duration", time.Since(start),
+		)
 		if s.ReadTimeout > 0 {
 			_ = conn.SetWriteDeadline(time.Now().Add(s.ReadTimeout))
 		}
@@ -239,7 +291,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		log.Debug("control reply write failed", "error", err)
 		return
 	}
-	log.Debug("control request served", "bytes", len(result), "duration", time.Since(start))
+	log.Info("request completed",
+		"event", "request.completed",
+		"bytes", len(result),
+		"duration", time.Since(start),
+	)
 }
 
 // Close stops accepting connections and unlinks the socket file.

@@ -13,8 +13,8 @@ Originally extracted from system services such as [`pkg-brokerd`](https://github
 | [`config`](#config) | Type-safe environment variable parsing | Validates positive durations and booleans with helpful error messages. |
 | [`ctl`](#ctl) | Unix domain socket IPC & CLI dispatcher | Robust daemon control plane with framing protocol, client, server, and CLI subcommands. |
 | [`execout`](#execout) | Process outcome classification & formatting | Classifies exits, timeouts, and cancellations into structured slog attributes and wrapped errors. |
-| [`httpapi`](#httpapi) | JSON HTTP API server | Bounded payload sizes, bearer auth, and graceful context-aware shutdown for HTTP services. |
-| [`logctx`](#logctx) | Context-aware structured logging | Injects/extracts `*slog.Logger` in `context.Context` and correlates logs via random `exec_id`s. |
+| [`httpapi`](#httpapi) | JSON HTTP API server | Bounded payload sizes, bearer auth, automatic `request_id` correlation, and graceful context-aware shutdown. |
+| [`logctx`](#logctx) | Context-aware structured logging | Injects/extracts `*slog.Logger` in `context.Context` and correlates logs via a 3-tier causal hierarchy (`request_id`, `operation_id`, `exec_id`). |
 | [`logging`](#logging) | Uniform slog configuration | Provides microsecond RFC3339 timestamps and case-insensitive log level parsing. |
 | [`mcpserver/auth`](#mcpserverauth) | HTTP Bearer token authentication | Constant-time bearer token middleware with `WWW-Authenticate` challenge headers. |
 | [`mcpserver/tools`](#mcpservertools) | Model Context Protocol tool helpers | Generates JSON schemas via reflection and instruments MCP tool handlers with metrics and tracing. |
@@ -255,10 +255,20 @@ func main() {
 - `With(ctx context.Context, logger *slog.Logger) context.Context`: Injects an `*slog.Logger` into context.
 - `From(ctx context.Context) *slog.Logger`: Retrieves the contextual logger, falling back to `slog.Default()`.
 - `NewID() string`: Generates a random 6-character hex identifier.
+- `WithRequestID(ctx context.Context, id string) context.Context`: Attaches `request_id` to context and contextual logger.
+- `RequestID(ctx context.Context) string`: Extracts `request_id` from context.
+- `WithOperationID(ctx context.Context, id string) context.Context`: Attaches `operation_id` to context and contextual logger.
+- `OperationID(ctx context.Context) string`: Extracts `operation_id` from context.
+- `WithExecID(ctx context.Context, id string) context.Context`: Attaches `exec_id` to context and contextual logger.
+- `ExecID(ctx context.Context) string`: Extracts `exec_id` from context.
+- `WithAttrs(ctx context.Context, attrs ...any) context.Context`: Decorates contextual logger with arbitrary domain attributes (`target`, `package`, etc.).
 - `FromWithID(ctx context.Context, id string) *slog.Logger`: Retrieves the logger with an attached `exec_id` attribute.
 
 #### Why It Exists
-In concurrent services executing multiple tasks or background commands simultaneously, log lines from different workers easily interleave. Passing the logger via `context.Context` ensures that contextual attributes (such as target names, session IDs, or random execution correlation IDs) automatically follow all downstream function calls without polluting function signatures.
+In concurrent services executing multiple tasks or background commands simultaneously, log lines from different workers easily interleave. Passing the logger and correlation IDs via `context.Context` ensures that contextual attributes automatically follow all downstream function calls without polluting function signatures:
+- **`request_id`**: Identifies boundary requests (e.g. HTTP, CLI, MCP).
+- **`operation_id`**: Identifies business operations (e.g. package prep, cache refresh).
+- **`exec_id`**: Identifies individual subprocess runs (e.g. sandboxed `zypper` or `rpm` executions).
 
 #### Usage Example
 ```go
@@ -272,20 +282,27 @@ import (
 	"github.com/jirib/golang-jirib-utils/logctx"
 )
 
-func executeTask(ctx context.Context) {
+func runStep(ctx context.Context) {
+	// Automatically includes request_id, operation_id, target, and exec_id
 	log := logctx.From(ctx)
-	log.Info("executing task step")
+	log.Info("step completed", "outcome", "ok")
 }
 
 func main() {
 	baseLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx := logctx.With(context.Background(), baseLogger)
 
-	// Decorate context with an execution ID
-	execID := logctx.NewID()
-	taskCtx := logctx.With(ctx, logctx.FromWithID(ctx, execID))
+	// 1. Boundary: attach request_id
+	ctx = logctx.WithRequestID(ctx, "8f31")
 
-	executeTask(taskCtx)
+	// 2. Domain operation: attach operation_id and domain attributes
+	ctx = logctx.WithOperationID(ctx, "op-91ac")
+	ctx = logctx.WithAttrs(ctx, "target", "opensuse/tumbleweed", "package", "kernel-default")
+
+	// 3. Execution: attach exec_id
+	taskCtx := logctx.WithExecID(ctx, "3144d2")
+
+	runStep(taskCtx)
 }
 ```
 

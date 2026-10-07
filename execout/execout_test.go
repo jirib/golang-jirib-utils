@@ -179,7 +179,7 @@ func mustState(t *testing.T, name string, args ...string) *os.ProcessState {
 func TestAttrs(t *testing.T) {
 	clean := Result{Outcome: OutcomeOK, PID: 42, RC: 0}
 	got := render(clean.Attrs(time.Second, time.Minute, "cmd", "zypper"))
-	for _, want := range []string{"cmd=zypper", "outcome=ok", "pid=42", "rc=0"} {
+	for _, want := range []string{"cmd=zypper", "outcome=ok", "pid=42", "rc=0", "exit_code=0"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("clean exit missing %q: %s", want, got)
 		}
@@ -193,7 +193,7 @@ func TestAttrs(t *testing.T) {
 
 	killed := Result{Outcome: OutcomeTimeout, PID: 43, RC: -1, Signal: "killed"}
 	got = render(killed.Attrs(5*time.Minute, 5*time.Minute, "cmd", "zypper"))
-	for _, want := range []string{"outcome=timeout", "signal=killed", "rc=-1", "deadline=5m0s"} {
+	for _, want := range []string{"outcome=timeout", "signal=killed", "rc=-1", "exit_code=-1", "deadline=5m0s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("timeout missing %q: %s", want, got)
 		}
